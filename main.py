@@ -683,6 +683,80 @@ async def bakiye_ver(interaction: discord.Interaction, kullanici: discord.Member
     await auto_backup(bot)
     await interaction.response.send_message(f"✅ {kullanici.mention} hesabına **{miktar:,.2f} ₺** eklendi.")
 
+@bot.tree.command(name="toplu-bakiye-ver", description="[YÖNETİCİ] Belirli bir role sahip herkese maaş/bakiye dağıtır.")
+@app_commands.default_permissions(administrator=True)
+async def toplu_bakiye_ver(interaction: discord.Interaction, rol: discord.Role, miktar: float):
+    db = load_db()
+    kisi_sayisi = 0
+    for member in rol.members:
+        hesap = get_or_create_user(db, str(member.id))
+        hesap["bakiye"] = round(hesap["bakiye"] + miktar, 2)
+        kisi_sayisi += 1
+    
+    save_db(db)
+    await auto_backup(bot)
+    await interaction.response.send_message(f"✅ **{rol.name}** rolündeki **{kisi_sayisi}** kişiye toplam **{miktar * kisi_sayisi:,.2f} ₺** bakiye dağıtıldı.")
+
+@bot.tree.command(name="hesap-mudahale", description="[YÖNETİCİ] IBAN üzerinden kullanıcının bakiyesine el koyar/ekler.")
+@app_commands.default_permissions(administrator=True)
+async def hesap_mudahale(interaction: discord.Interaction, iban: str, eklenecek_tutar: float):
+    db = load_db()
+    hedef_iban = clean_iban(iban)
+    hedef_id = next((uid for uid, data in db["users"].items() if data.get("iban") == hedef_iban), None)
+            
+    if not hedef_id: return await interaction.response.send_message("❌ Bu IBAN'a ait hesap bulunamadı.", ephemeral=True)
+        
+    db["users"][hedef_id]["bakiye"] = round(db["users"][hedef_id]["bakiye"] + eklenecek_tutar, 2)
+    save_db(db)
+    await auto_backup(bot)
+    await interaction.response.send_message(f"✅ **{hedef_iban}** nolu hesaba müdahale edildi. Yeni Bakiye: **{db['users'][hedef_id]['bakiye']:,.2f} ₺**")
+
+@bot.tree.command(name="kredi-yapilandir", description="[YÖNETİCİ] Borcu şişen kullanıcının faiz döngüsünü sıfırlar.")
+@app_commands.default_permissions(administrator=True)
+async def kredi_yapilandir(interaction: discord.Interaction, kullanici: discord.Member, yeni_borc_tutari: float):
+    db = load_db()
+    hesap = get_or_create_user(db, str(kullanici.id))
+    hesap["kredi_borcu"] = round(yeni_borc_tutari, 2)
+    hesap["kredi_gun_sayisi"] = 0
+    save_db(db)
+    await auto_backup(bot)
+    await interaction.response.send_message(f"✅ {kullanici.mention} kullanıcısının borcu **{yeni_borc_tutari:,.2f} ₺** olarak sabitlendi ve faiz gün sayacı sıfırlandı.")
+
+@bot.tree.command(name="hesap-dondur", description="[YÖNETİCİ] Şüpheli kullanıcının banka hesabını kilitler.")
+@app_commands.default_permissions(administrator=True)
+async def hesap_dondur(interaction: discord.Interaction, kullanici: discord.Member):
+    db = load_db()
+    hesap = get_or_create_user(db, str(kullanici.id))
+    hesap["durum"] = "dondurulmus"
+    save_db(db)
+    await auto_backup(bot)
+    await interaction.response.send_message(f"🔴 {kullanici.mention} adlı kullanıcının banka hesabı **donduruldu/bloke edildi**.")
+
+@bot.tree.command(name="hesap-ac", description="[YÖNETİCİ] Bloke edilen banka hesabını tekrar aktif eder.")
+@app_commands.default_permissions(administrator=True)
+async def hesap_ac(interaction: discord.Interaction, kullanici: discord.Member):
+    db = load_db()
+    hesap = get_or_create_user(db, str(kullanici.id))
+    hesap["durum"] = "aktif"
+    save_db(db)
+    await auto_backup(bot)
+    await interaction.response.send_message(f"🟢 {kullanici.mention} adlı kullanıcının banka hesabı tekrar **aktif** edildi.")
+
+@bot.tree.command(name="komisyon-ayarla", description="[YÖNETİCİ] Sistem komisyon oranlarını ayarlar (Örn: %5 için 0.05 yazın).")
+@app_commands.describe(tur="Hangi komisyon değişecek?", oran="Yeni oran (0.05 = %5)")
+@app_commands.choices(tur=[
+    app_commands.Choice(name="Ödeme Komisyonu", value="komisyon_odeme"),
+    app_commands.Choice(name="Çekim Komisyonu", value="komisyon_cekme"),
+    app_commands.Choice(name="Havale Komisyonu", value="komisyon_havale")
+])
+@app_commands.default_permissions(administrator=True)
+async def komisyon_ayarla(interaction: discord.Interaction, tur: app_commands.Choice[str], oran: float):
+    db = load_db()
+    db["ayarlar"][tur.value] = oran
+    save_db(db)
+    await auto_backup(bot)
+    await interaction.response.send_message(f"✅ **{tur.name}** başarıyla **%{int(oran*100)}** olarak güncellendi!")
+
 @bot.tree.command(name="ceza-ayarla", description="[YÖNETİCİ] Kredi faiz oranını ve haftalık gecikme cezasını belirler.")
 @app_commands.default_permissions(administrator=True)
 async def ceza_ayarla(interaction: discord.Interaction, faiz_yuzdesi: float, gecikme_cezasi_tl: float):
@@ -706,6 +780,34 @@ async def log_kanal_ayarla(interaction: discord.Interaction, kanal: discord.Text
 @app_commands.default_permissions(administrator=True)
 async def json_yedekle(interaction: discord.Interaction):
     await interaction.response.send_message("📂 Güncel Veritabanı:", file=discord.File(DB_FILE, filename="bank_db_yedek.json"), ephemeral=True)
+
+@bot.tree.command(name="kasa-grafik", description="[YÖNETİCİ] Banka kasasının dağılım grafiğini çizer.")
+@app_commands.default_permissions(administrator=True)
+async def kasa_grafik(interaction: discord.Interaction):
+    db = load_db()
+    toplam_kasa = db.get("kasa", 0)
+    toplam_kredi = sum(u.get("kredi_borcu", 0) for u in db["users"].values())
+    toplam_mevduat = sum(u.get("bakiye", 0) for u in db["users"].values())
+
+    labels = ['Banka Kasası', 'Dağıtılan Krediler', 'Müşteri Bakiyeleri']
+    sizes = [toplam_kasa, toplam_kredi, toplam_mevduat]
+    colors = ['#2ecc71', '#e74c3c', '#3498db']
+
+    if sum(sizes) == 0: sizes = [1, 1, 1]
+
+    plt.figure(figsize=(6, 6))
+    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=140)
+    plt.title('Merkez Bankası Varlık Dağılımı')
+
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format='png', bbox_inches='tight')
+    buffer.seek(0)
+    plt.close()
+
+    file = discord.File(buffer, filename="kasa_grafik.png")
+    embed = discord.Embed(title="📊 Banka Finansal Durum Grafiği", color=discord.Color.gold())
+    embed.set_image(url="attachment://kasa_grafik.png")
+    await interaction.response.send_message(embed=embed, file=file)
 
 if TOKEN:
     keep_alive()
