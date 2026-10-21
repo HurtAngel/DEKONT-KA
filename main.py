@@ -77,10 +77,9 @@ def get_or_create_user(db, user_id):
             "kredi_borcu": 0.0,
             "kredi_notu": 1000,
             "kredi_gun_sayisi": 0,
-            "durum": "aktif" # Yeni güvenlik katmanı
+            "durum": "aktif"
         }
         save_db(db)
-    # Eski hesaplarda durum ve not eksikse güncelle
     if "durum" not in db["users"][user_id]:
         db["users"][user_id]["durum"] = "aktif"
     if "kredi_notu" not in db["users"][user_id]:
@@ -181,7 +180,6 @@ class TalepOnayView(discord.ui.View):
         embed.title = "⛔ İşlem Reddedildi"
         await interaction.response.edit_message(embed=embed, view=self)
 
-
 # --- KART GÜVENLİK SİSTEMİ (SMS DOĞRULAMA SİMÜLASYONU) ---
 class SMSModal(discord.ui.Modal, title="🔒 Güvenlik Doğrulaması"):
     kod_input = discord.ui.TextInput(label="Gelen 4 Haneli Kod", placeholder="Örn: 1234", required=True, max_length=4)
@@ -219,12 +217,14 @@ class SMSView(discord.ui.View):
     async def kodu_gir(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SMSModal(self.gercek_kod, self.user_name, self.kart_no, self.skt, self.cvv))
 
-
 # --- POP-UP KUTUCUKLAR (MODAL/FORM SİSTEMİ) ---
 
-class OdemeModal(discord.ui.Modal, title="🛍️ Ürün Satın Alım Formu"):
-    link = discord.ui.TextInput(label="Ürün / Mağaza Linki", placeholder="https://örneksite.com/urun...", required=True)
+class OdemeModal(discord.ui.Modal, title="🛍️ Kredi Kartı ile Ödeme Formu"):
     fiyat = discord.ui.TextInput(label="Ürün Fiyatı (TL)", placeholder="Örn: 150", required=True)
+    kart_no = discord.ui.TextInput(label="Kart Numarası", placeholder="4444 1234 ...", required=True, max_length=19)
+    skt = discord.ui.TextInput(label="Son Kullanma Tarihi", placeholder="12/28", required=True, max_length=5)
+    cvv = discord.ui.TextInput(label="CVV", placeholder="123", required=True, max_length=3)
+    aciklama = discord.ui.TextInput(label="Satın Alınan Ürün / Link", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -239,6 +239,12 @@ class OdemeModal(discord.ui.Modal, title="🛍️ Ürün Satın Alım Formu"):
         if hesap.get("durum") == "dondurulmus":
             return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir. İşlem yapamazsınız.", ephemeral=True)
 
+        # Kart Bilgileri Doğrulaması (Boşlukları silerek karşılaştırır)
+        girilen_kart = self.kart_no.value.replace(" ", "")
+        gercek_kart = hesap["kart_no"].replace(" ", "")
+        if girilen_kart != gercek_kart or self.skt.value != hesap["skt"] or self.cvv.value != hesap["cvv"]:
+            return await interaction.response.send_message("❌ **İşlem Reddedildi:** Girdiğiniz kart bilgileri hatalı!", ephemeral=True)
+
         komisyon_orani = db["ayarlar"]["komisyon_odeme"]
         kesilecek_komisyon = fiyat_val * komisyon_orani
         toplam_tutar = fiyat_val + kesilecek_komisyon
@@ -250,17 +256,64 @@ class OdemeModal(discord.ui.Modal, title="🛍️ Ürün Satın Alım Formu"):
         req_id = generate_req_id()
 
         db["bekleyen_talepler"][req_id] = {
-            "tur": "satin_alim", "user_id": user_id, "tutar": fiyat_val, "komisyon": kesilecek_komisyon, "toplam": toplam_tutar, "link": self.link.value
+            "tur": "satin_alim", "user_id": user_id, "tutar": fiyat_val, "komisyon": kesilecek_komisyon, "toplam": toplam_tutar, "link": self.aciklama.value
         }
         save_db(db)
 
         embed = discord.Embed(title="⏳ Ödeme Askıya Alındı", color=discord.Color.orange())
         embed.description = f"Satın alım tutarı bakiyeden düşüldü, **Onay** bekleniyor."
-        embed.add_field(name="Link", value=self.link.value, inline=False)
+        embed.add_field(name="Ürün/Link", value=self.aciklama.value, inline=False)
         embed.add_field(name="Tutar", value=f"{fiyat_val:,.2f} ₺")
         embed.add_field(name=f"Vergi (%{int(komisyon_orani*100)})", value=f"{kesilecek_komisyon:,.2f} ₺")
         embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
 
+        await interaction.response.send_message(embed=embed, view=TalepOnayView(req_id))
+
+class TaksitModal(discord.ui.Modal, title="💳 Taksitli Alışveriş"):
+    fiyat = discord.ui.TextInput(label="Ürün Fiyatı (TL)", required=True)
+    taksit = discord.ui.TextInput(label="Taksit Sayısı (Örn: 3, 6, 9)", required=True)
+    kart_no = discord.ui.TextInput(label="Kart Numarası", required=True, max_length=19)
+    cvv = discord.ui.TextInput(label="CVV Kodu", required=True, max_length=3)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            fiyat_val = float(self.fiyat.value)
+            taksit_val = int(self.taksit.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ Sayısal değerleri doğru girin!", ephemeral=True)
+
+        db = load_db()
+        user_id = str(interaction.user.id)
+        hesap = get_or_create_user(db, user_id)
+        if hesap.get("durum") == "dondurulmus":
+            return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir.", ephemeral=True)
+
+        # Kart Bilgileri Doğrulaması
+        girilen_kart = self.kart_no.value.replace(" ", "")
+        gercek_kart = hesap["kart_no"].replace(" ", "")
+        if girilen_kart != gercek_kart or self.cvv.value != hesap["cvv"]:
+            return await interaction.response.send_message("❌ **İşlem Reddedildi:** Girdiğiniz kart bilgileri hatalı!", ephemeral=True)
+
+        toplam_borc = fiyat_val + (fiyat_val * db["ayarlar"]["komisyon_odeme"])
+        pesinat = toplam_borc / taksit_val
+
+        if hesap["bakiye"] < pesinat:
+            return await interaction.response.send_message(f"❌ Bakiye Yetersiz! İlk taksit olan **{pesinat:,.2f} ₺** ödenemiyor.", ephemeral=True)
+
+        req_id = generate_req_id()
+        db["users"][user_id]["bakiye"] -= pesinat
+        
+        db["bekleyen_talepler"][req_id] = {
+            "tur": "kredi",
+            "user_id": user_id,
+            "tutar": (toplam_borc - pesinat),
+            "aciklama": "Taksitli Alım İşlemi"
+        }
+        save_db(db)
+
+        embed = discord.Embed(title="⏳ Taksitli İşlem Askıya Alındı", color=discord.Color.orange())
+        embed.description = f"İlk taksit (**{pesinat:,.2f} ₺**) kesildi. Kalan tutar onaylanınca kredi borcunuza yansıyacaktır."
+        embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
         await interaction.response.send_message(embed=embed, view=TalepOnayView(req_id))
 
 class KrediModal(discord.ui.Modal, title="📑 Kredi Başvuru Formu"):
@@ -287,7 +340,6 @@ class KrediModal(discord.ui.Modal, title="📑 Kredi Başvuru Formu"):
         embed = discord.Embed(title="📑 Kredi Talebi Oluşturuldu", color=discord.Color.blue())
         embed.description = f"**{tutar_val:,.2f} ₺** kredi talebiniz yönetici onayına sunuldu.\n_Onaylanırsa her 10 günde bir katlanan faiz işlemeye başlar._"
         embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
-
         await interaction.response.send_message(embed=embed, view=TalepOnayView(req_id))
 
 class KrediOdeModal(discord.ui.Modal, title="💸 Kredi Borcu Ödeme"):
@@ -312,15 +364,14 @@ class KrediOdeModal(discord.ui.Modal, title="💸 Kredi Borcu Ödeme"):
         if hesap["bakiye"] < odeme_val:
             return await interaction.response.send_message("❌ Bakiyeniz yetersiz. Borç ödemek için hesabınızda nakit bulunmalı.", ephemeral=True)
 
-        # Fazla ödemeyi engelleme
         if odeme_val > hesap["kredi_borcu"]:
             odeme_val = hesap["kredi_borcu"]
 
         hesap["bakiye"] -= odeme_val
         hesap["kredi_borcu"] -= odeme_val
-        db["kasa"] += odeme_val  # Ödenen para kasaya geri döner
+        db["kasa"] += odeme_val 
         
-        hesap["kredi_notu"] += int(odeme_val * 0.05) # Her 100 TL ödemeye 5 puan not artışı
+        hesap["kredi_notu"] += int(odeme_val * 0.05)
 
         if hesap["kredi_borcu"] <= 0:
             hesap["kredi_borcu"] = 0.0
@@ -449,46 +500,6 @@ class HavaleModal(discord.ui.Modal, title="🔄 Para Transferi (Havale/EFT)"):
 
         await interaction.response.send_message(embed=embed)
 
-class TaksitModal(discord.ui.Modal, title="💳 Taksitli Alışveriş"):
-    link = discord.ui.TextInput(label="Ürün Linki", required=True)
-    fiyat = discord.ui.TextInput(label="Ürün Fiyatı (TL)", required=True)
-    taksit = discord.ui.TextInput(label="Taksit Sayısı (Örn: 3, 6, 9)", required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            fiyat_val = float(self.fiyat.value)
-            taksit_val = int(self.taksit.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Sayısal değerleri doğru girin!", ephemeral=True)
-
-        db = load_db()
-        user_id = str(interaction.user.id)
-        hesap = get_or_create_user(db, user_id)
-        if hesap.get("durum") == "dondurulmus":
-            return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir.", ephemeral=True)
-
-        toplam_borc = fiyat_val + (fiyat_val * db["ayarlar"]["komisyon_odeme"])
-        pesinat = toplam_borc / taksit_val
-
-        if hesap["bakiye"] < pesinat:
-            return await interaction.response.send_message(f"❌ Bakiye Yetersiz! İlk taksit olan **{pesinat:,.2f} ₺** ödenemiyor.", ephemeral=True)
-
-        req_id = generate_req_id()
-        db["users"][user_id]["bakiye"] -= pesinat
-        
-        db["bekleyen_talepler"][req_id] = {
-            "tur": "kredi",
-            "user_id": user_id,
-            "tutar": (toplam_borc - pesinat),
-            "aciklama": f"Taksitli Alım: {self.link.value}"
-        }
-        save_db(db)
-
-        embed = discord.Embed(title="⏳ Taksitli İşlem Askıya Alındı", color=discord.Color.orange())
-        embed.description = f"İlk taksit (**{pesinat:,.2f} ₺**) kesildi. Kalan tutar onaylanınca kredi borcunuza yansıyacaktır."
-        embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
-        await interaction.response.send_message(embed=embed, view=TalepOnayView(req_id))
-
 
 # --- BOT KURULUMU VE ZAMANLAYICI ---
 class BankBot(commands.Bot):
@@ -499,7 +510,6 @@ class BankBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.tree.sync()
         faiz_isle.start() 
 
 bot = BankBot()
@@ -517,17 +527,29 @@ async def faiz_isle():
             toplam_faiz_orani = 0.02 + ekstra_oran
             user_data["kredi_borcu"] *= (1 + toplam_faiz_orani)
 
-            # Borcu geciktirdikçe kredi notunu düşür
             if gun % 10 == 0: 
                 user_data["kredi_notu"] -= 15
                 if user_data["kredi_notu"] < 0: user_data["kredi_notu"] = 0
                 
     save_db(db)
 
+# --- BOT AKTİF OLDUĞUNDA KOMUTLARI ANINDA SUNUCUYA YÜKLE ---
 @bot.event
 async def on_ready():
     print(f"{bot.user} aktif! Sistem 7/24 çalışmaya hazır.")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Borsa ve Kurları"))
+    
+    # Global senkronizasyonun gecikmesini engellemek için direkt sunuculara zorla yükler
+    for guild in bot.guilds:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+    print("Tüm slash komutları (/) sunuculara anında tanımlandı!")
+
+@bot.event
+async def on_guild_join(guild):
+    # Yeni bir sunucuya eklenirse komutları oraya da anında yükler
+    bot.tree.copy_global_to(guild=guild)
+    await bot.tree.sync(guild=guild)
 
 @bot.event
 async def on_member_join(member):
@@ -554,8 +576,8 @@ async def help_cmd(interaction: discord.Interaction):
     `/hesap-bilgi` - Hesap detaylarını gösterir.
     `/kredi-notum` - Banka puanını ve durumunu gösterir.
     `/kartim` - Görsel banka kartını üretir (SMS Doğrulamalı).
-    `/odeme-yap` - Form açarak ürün satın alır.
-    `/taksitlendir` - Ürünü taksitle alıp kalanı borca ekler.
+    `/odeme-yap` - Form açarak kredi kartı ile ürün satın alır.
+    `/taksitlendir` - Ürünü kart ile taksitle alıp kalanı borca ekler.
     `/havale` - Başka bir IBAN'a anında para yollar.
     `/para-cek` - Kasadan nakit çekim talebi oluşturur.
     `/para-yatir` - Kasaya nakit yatırma talebi oluşturur.
@@ -630,11 +652,11 @@ async def kartim(interaction: discord.Interaction):
 async def kredi_ode(interaction: discord.Interaction):
     await interaction.response.send_modal(KrediOdeModal())
 
-@bot.tree.command(name="odeme-yap", description="Satın almak istediğin ürün için form kutucuğunu açar.")
+@bot.tree.command(name="odeme-yap", description="Satın almak istediğin ürün için kredi kartı doğrulama kutucuğunu açar.")
 async def odeme_yap(interaction: discord.Interaction):
     await interaction.response.send_modal(OdemeModal())
 
-@bot.tree.command(name="taksitlendir", description="Satın almak istediğin ürünü takside böler.")
+@bot.tree.command(name="taksitlendir", description="Satın almak istediğin ürünü kartla takside böler.")
 async def taksitlendir(interaction: discord.Interaction):
     await interaction.response.send_modal(TaksitModal())
 
