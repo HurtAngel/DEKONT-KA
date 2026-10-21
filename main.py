@@ -8,7 +8,6 @@ import string
 import io
 from PIL import Image, ImageDraw, ImageFont
 
-# Linux sunucularında grafik çizerken çökme yapmaması için arkaplan motoru:
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -16,7 +15,7 @@ import matplotlib.pyplot as plt
 from flask import Flask
 from threading import Thread
 
-# --- MINIK WEB SUNUCUSU (UptimeRobot İçin 7/24 Aktif Tutucu) ---
+# --- MINIK WEB SUNUCUSU (UptimeRobot İçin) ---
 app = Flask('')
 
 @app.route('/')
@@ -24,7 +23,6 @@ def home():
     return "Merkez Bankası Botu 7/24 Aktif!"
 
 def run():
-    # Render.com'un atadığı portu veya varsayılan 8080'i kullanır
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -55,6 +53,20 @@ def generate_card_number():
 def generate_req_id():
     return "REQ-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
+def get_or_create_user(db, user_id):
+    if user_id not in db["users"]:
+        db["users"][user_id] = {
+            "bakiye": 0.0,
+            "iban": generate_iban(),
+            "kart_no": generate_card_number(),
+            "skt": "12/28",
+            "cvv": str(random.randint(100, 999)),
+            "kredi_borcu": 0.0,
+            "kredi_notu": 1000
+        }
+        save_db(db)
+    return db["users"][user_id]
+
 # --- GÖRSEL KREDİ KARTI ÜRETİCİ (PILLOW) ---
 def generate_credit_card(user_name, card_number, exp_date, cvv):
     img = Image.new('RGB', (800, 500), color='#1e1e2f')
@@ -83,7 +95,7 @@ def generate_credit_card(user_name, card_number, exp_date, cvv):
     buffer.seek(0)
     return buffer
 
-# --- TIKLANABİLİR BUTONLU ONAY SİSTEMİ ---
+# --- YÖNETİCİ ONAY/RED BUTONLARI ---
 class TalepOnayView(discord.ui.View):
     def __init__(self, req_id):
         super().__init__(timeout=None)
@@ -144,6 +156,97 @@ class TalepOnayView(discord.ui.View):
         embed.title = "⛔ İşlem Reddedildi"
         await interaction.response.edit_message(embed=embed, view=self)
 
+# --- POP-UP KUTUCUKLAR (MODAL/FORM SİSTEMİ) ---
+
+# 1. Satın Alım Formu (Link & Fiyat Kutucuğu)
+class OdemeModal(discord.ui.Modal, title="🛍️ Ürün Satın Alım / Ödeme Formu"):
+    link = discord.ui.TextInput(
+        label="Ürün / Mağaza Linki",
+        placeholder="https://örneksite.com/urun...",
+        required=True
+    )
+    fiyat = discord.ui.TextInput(
+        label="Ürün Fiyatı (TL)",
+        placeholder="Örn: 150",
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            fiyat_val = float(self.fiyat.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ Lütfen geçerli bir sayısal fiyat girin!", ephemeral=True)
+
+        db = load_db()
+        user_id = str(interaction.user.id)
+        hesap = get_or_create_user(db, user_id)
+
+        komisyon_orani = 0.60
+        kesilecek_komisyon = fiyat_val * komisyon_orani
+        toplam_tutar = fiyat_val + kesilecek_komisyon
+
+        if hesap["bakiye"] < toplam_tutar:
+            embed = discord.Embed(title="❌ Yetersiz Bakiye", description=f"Ürün + %60 Vergi için toplam **{toplam_tutar:,.2f} ₺** gerekiyor.", color=discord.Color.red())
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        hesap["bakiye"] -= toplam_tutar
+        req_id = generate_req_id()
+
+        db["bekleyen_talepler"][req_id] = {
+            "tur": "satin_alim",
+            "user_id": user_id,
+            "tutar": fiyat_val,
+            "komisyon": kesilecek_komisyon,
+            "toplam": toplam_tutar,
+            "link": self.link.value
+        }
+        save_db(db)
+
+        embed = discord.Embed(title="⏳ Ödeme Talebi Askıya Alındı", color=discord.Color.orange())
+        embed.description = f"Satın alım tutarı bakiyenizden düşüldü, **Yönetici Onayı** bekleniyor."
+        embed.add_field(name="Link", value=self.link.value, inline=False)
+        embed.add_field(name="Tutar", value=f"{fiyat_val:,.2f} ₺")
+        embed.add_field(name="Vergi (%60)", value=f"{kesilecek_komisyon:,.2f} ₺")
+        embed.add_field(name="Toplam Çekilen", value=f"{toplam_tutar:,.2f} ₺")
+        embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
+
+        view = TalepOnayView(req_id)
+        await interaction.response.send_message(embed=embed, view=view)
+
+# 2. Kredi Başvuru Formu (Kutucuk)
+class KrediModal(discord.ui.Modal, title="📑 Kredi Başvuru Formu"):
+    tutar = discord.ui.TextInput(
+        label="Çekmek İstediğiniz Kredi Tutarı (TL)",
+        placeholder="Örn: 5000",
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            tutar_val = float(self.tutar.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ Lütfen geçerli bir tutar girin!", ephemeral=True)
+
+        db = load_db()
+        user_id = str(interaction.user.id)
+        get_or_create_user(db, user_id)
+
+        req_id = generate_req_id()
+        db["bekleyen_talepler"][req_id] = {
+            "tur": "kredi",
+            "user_id": user_id,
+            "tutar": tutar_val
+        }
+        save_db(db)
+
+        embed = discord.Embed(title="📑 Kredi Talebi Oluşturuldu", color=discord.Color.blue())
+        embed.description = f"**{tutar_val:,.2f} ₺** tutarındaki kredi talebiniz yönetici onayına sunuldu."
+        embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
+
+        view = TalepOnayView(req_id)
+        await interaction.response.send_message(embed=embed, view=view)
+
+
 # --- BOT KURULUMU ---
 class BankBot(commands.Bot):
     def __init__(self):
@@ -158,7 +261,7 @@ class BankBot(commands.Bot):
 
 bot = BankBot()
 
-# --- GÜNLÜK FAİZ ZAMANLAYICISI (24 SAATTE BİR %2) ---
+# --- GÜNLÜK FAİZ ZAMANLAYICISI ---
 @tasks.loop(hours=24)
 async def faiz_isle():
     db = load_db()
@@ -172,37 +275,35 @@ async def on_ready():
     print(f"{bot.user} aktif! Sistem 7/24 çalışmaya hazır.")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Borsa ve Kurları"))
 
-# --- OTOMATİK HESAP VE KANAL AÇMA ---
 @bot.event
 async def on_member_join(member):
     db = load_db()
-    user_id = str(member.id)
+    get_or_create_user(db, str(member.id))
+
+    guild = member.guild
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        member: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    }
     
-    if user_id not in db["users"]:
-        db["users"][user_id] = {
-            "bakiye": 0.0,
-            "iban": generate_iban(),
-            "kart_no": generate_card_number(),
-            "skt": "12/28",
-            "cvv": str(random.randint(100, 999)),
-            "kredi_borcu": 0.0,
-            "kredi_notu": 1000
-        }
-        save_db(db)
+    kanal_adi = f"💳・{member.name}-hesap"
+    try:
+        await guild.create_text_channel(kanal_adi, overwrites=overwrites)
+    except Exception:
+        pass
 
-        guild = member.guild
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            member: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-        }
-        
-        kanal_adi = f"💳・{member.name}-hesap"
-        try:
-            await guild.create_text_channel(kanal_adi, overwrites=overwrites)
-        except Exception as e:
-            pass
+# --- KOMUTLAR (FORM/MODAL TETİKLEYİCİLERİ) ---
 
-# --- KOMUTLAR ---
+@bot.tree.command(name="odeme-yap", description="Satın almak istediğin ürün için form kutucuğunu açar.")
+async def odeme_yap(interaction: discord.Interaction):
+    # Ekranda doldurmalı kutucuk (Modal) açar
+    await interaction.response.send_modal(OdemeModal())
+
+@bot.tree.command(name="kredi-cek", description="Kredi başvurusu yapmak için form kutucuğunu açar.")
+async def kredi_cek(interaction: discord.Interaction):
+    # Ekranda doldurmalı kutucuk (Modal) açar
+    await interaction.response.send_modal(KrediModal())
+
 @bot.tree.command(name="help", description="Tüm banka komutlarını listeler.")
 async def help_cmd(interaction: discord.Interaction):
     is_admin = interaction.user.guild_permissions.administrator
@@ -211,13 +312,14 @@ async def help_cmd(interaction: discord.Interaction):
     user_cmds = """
     `/hesap-bilgi` - Bakiyeni ve hesap detaylarını gör.
     `/kartim` - Görsel banka kartını üretir ve atar.
-    `/al-link` - Link ile komisyonlu satın alım talebi oluşturur.
-    `/kredi-cek` - Bankadan kredi talep et.
+    `/odeme-yap` - Form kutucuğu açarak ürün satın alım talebi oluşturur.
+    `/kredi-cek` - Form kutucuğu açarak bankadan kredi talep eder.
     """
     embed.add_field(name="👤 Müşteri Komutları", value=user_cmds, inline=False)
     
     if is_admin:
         admin_cmds = """
+        `/bakiye-ver` - Bir kullanıcıya bakiye ekler veya hesabını açar.
         `/kasa-grafik` - Kasadaki paranı ve varlık dağılım grafiğini çizer.
         """
         embed.add_field(name="🛠️ Yönetici Komutları", value=admin_cmds, inline=False)
@@ -227,12 +329,8 @@ async def help_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="hesap-bilgi", description="Banka hesabının güncel durumunu gösterir.")
 async def hesap_bilgi(interaction: discord.Interaction):
     db = load_db()
-    user_id = str(interaction.user.id)
+    hesap = get_or_create_user(db, str(interaction.user.id))
     
-    if user_id not in db["users"]:
-        return await interaction.response.send_message("❌ Bankamızda hesabınız bulunmamaktadır.", ephemeral=True)
-    
-    hesap = db["users"][user_id]
     embed = discord.Embed(title="🏦 Merkez Bankası Hesap Özeti", color=discord.Color.gold())
     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     embed.add_field(name="💰 Güncel Bakiye", value=f"**{hesap['bakiye']:,.2f} ₺**", inline=False)
@@ -245,12 +343,7 @@ async def hesap_bilgi(interaction: discord.Interaction):
 @bot.tree.command(name="kartim", description="Sana özel dijital kredi kartını üretir.")
 async def kartim(interaction: discord.Interaction):
     db = load_db()
-    user_id = str(interaction.user.id)
-    
-    if user_id not in db["users"]:
-        return await interaction.response.send_message("❌ Hesabınız bulunamadı.", ephemeral=True)
-        
-    hesap = db["users"][user_id]
+    hesap = get_or_create_user(db, str(interaction.user.id))
     
     card_img = generate_credit_card(
         user_name=interaction.user.display_name,
@@ -265,66 +358,19 @@ async def kartim(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, file=file)
 
-@bot.tree.command(name="al-link", description="Link üzerinden komisyonlu satın alım talebi oluşturur.")
-async def al_link(interaction: discord.Interaction, link: str, fiyat: float):
+@bot.tree.command(name="bakiye-ver", description="[YÖNETİCİ] Bir kullanıcıya bakiye ekler veya hesabını açar.")
+@app_commands.default_permissions(administrator=True)
+async def bakiye_ver(interaction: discord.Interaction, kullanici: discord.Member, miktar: float):
     db = load_db()
-    user_id = str(interaction.user.id)
+    hesap = get_or_create_user(db, str(kullanici.id))
     
-    if user_id not in db["users"]:
-        return await interaction.response.send_message("❌ Hesabınız bulunamadı.", ephemeral=True)
-    
-    komisyon_orani = 0.60
-    kesilecek_komisyon = fiyat * komisyon_orani
-    toplam_tutar = fiyat + kesilecek_komisyon
-    
-    if db["users"][user_id]["bakiye"] < toplam_tutar:
-        embed = discord.Embed(title="❌ Yetersiz Bakiye", description=f"Toplam **{toplam_tutar:,.2f} ₺** gerekiyor.", color=discord.Color.red())
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    db["users"][user_id]["bakiye"] -= toplam_tutar
-    req_id = generate_req_id()
-    
-    db["bekleyen_talepler"][req_id] = {
-        "tur": "satin_alim",
-        "user_id": user_id,
-        "tutar": fiyat,
-        "komisyon": kesilecek_komisyon,
-        "toplam": toplam_tutar,
-        "link": link
-    }
+    hesap["bakiye"] += miktar
     save_db(db)
     
-    embed = discord.Embed(title="⏳ İşlem Askıya Alındı", color=discord.Color.orange())
-    embed.description = f"Satın alım tutarı düşüldü, **Yönetici Onayı** bekleniyor."
-    embed.add_field(name="Tutar", value=f"{fiyat:,.2f} ₺")
-    embed.add_field(name="Vergi (%60)", value=f"{kesilecek_komisyon:,.2f} ₺")
-    embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
+    embed = discord.Embed(title="💰 Bakiye Tanımlandı", color=discord.Color.green())
+    embed.description = f"{kullanici.mention} hesabına **{miktar:,.2f} ₺** eklendi.\nGüncel Bakiye: **{hesap['bakiye']:,.2f} ₺**"
     
-    view = TalepOnayView(req_id)
-    await interaction.response.send_message(embed=embed, view=view)
-
-@bot.tree.command(name="kredi-cek", description="Banka kasasından kredi talep et.")
-async def kredi_cek(interaction: discord.Interaction, tutar: float):
-    db = load_db()
-    user_id = str(interaction.user.id)
-    
-    if user_id not in db["users"]:
-        return await interaction.response.send_message("❌ Hesabınız bulunamadı.", ephemeral=True)
-    
-    req_id = generate_req_id()
-    db["bekleyen_talepler"][req_id] = {
-        "tur": "kredi",
-        "user_id": user_id,
-        "tutar": tutar
-    }
-    save_db(db)
-    
-    embed = discord.Embed(title="📑 Kredi Talebi Alındı", color=discord.Color.blue())
-    embed.description = f"**{tutar:,.2f} ₺** kredi talebi oluşturuldu."
-    embed.add_field(name="İşlem Kodu", value=f"`{req_id}`")
-    
-    view = TalepOnayView(req_id)
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="kasa-grafik", description="[YÖNETİCİ] Banka kasasının dağılım grafiğini çizer.")
 @app_commands.default_permissions(administrator=True)
@@ -357,9 +403,6 @@ async def kasa_grafik(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, file=file)
 
-# Flask sunucusunu başlatıp ardından botu çalıştırıyoruz
 if TOKEN:
     keep_alive()
     bot.run(TOKEN)
-else:
-    print("❌ DISCORD_TOKEN bulunamadı! Lütfen Environment Variables bölümüne ekleyin.")
