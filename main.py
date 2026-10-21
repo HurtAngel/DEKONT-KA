@@ -6,6 +6,7 @@ import os
 import random
 import string
 import io
+import math
 from PIL import Image, ImageDraw, ImageFont
 
 import matplotlib
@@ -65,6 +66,32 @@ def generate_card_number():
 
 def generate_req_id():
     return "REQ-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+# --- BİÇİMLENDİRME YARDIMCILARI ---
+def clean_iban(raw_iban: str) -> str:
+    cleaned = raw_iban.strip().upper().replace(" ", "")
+    if not cleaned.startswith("TR"):
+        cleaned = "TR" + cleaned
+    return cleaned
+
+def clean_card_number(raw_card: str) -> str:
+    digits = "".join(filter(str.isdigit, raw_card))
+    return " ".join([digits[i:i+4] for i in range(0, len(digits), 4)])
+
+def clean_skt(raw_skt: str) -> str:
+    digits = "".join(filter(str.isdigit, raw_skt))
+    if len(digits) == 4:
+        return f"{digits[:2]}/{digits[2:]}"
+    return raw_skt.strip()
+
+def validate_positive_amount(val_str: str):
+    try:
+        val = float(val_str.replace(",", "."))
+        if math.isnan(val) or math.isinf(val) or val <= 0:
+            return None
+        return round(val, 2)
+    except ValueError:
+        return None
 
 def get_or_create_user(db, user_id):
     if user_id not in db["users"]:
@@ -180,57 +207,19 @@ class TalepOnayView(discord.ui.View):
         embed.title = "⛔ İşlem Reddedildi"
         await interaction.response.edit_message(embed=embed, view=self)
 
-# --- KART GÜVENLİK SİSTEMİ (SMS DOĞRULAMA SİMÜLASYONU) ---
-class SMSModal(discord.ui.Modal, title="🔒 Güvenlik Doğrulaması"):
-    kod_input = discord.ui.TextInput(label="Gelen 4 Haneli Kod", placeholder="Örn: 1234", required=True, max_length=4)
-
-    def __init__(self, gercek_kod, user_name, kart_no, skt, cvv):
-        super().__init__()
-        self.gercek_kod = gercek_kod
-        self.user_name = user_name
-        self.kart_no = kart_no
-        self.skt = skt
-        self.cvv = cvv
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if self.kod_input.value != self.gercek_kod:
-            return await interaction.response.send_message("❌ **Hatalı Kod!** Güvenlik doğrulaması başarısız.", ephemeral=True)
-        
-        card_img = generate_credit_card(self.user_name, self.kart_no, self.skt, self.cvv)
-        file = discord.File(card_img, filename="kredi_karti.png")
-        
-        embed = discord.Embed(title="💳 Dijital Kredi Kartınız", color=discord.Color.dark_purple())
-        embed.description = "Güvenlik doğrulaması başarılı. İşte kartınız:"
-        embed.set_image(url="attachment://kredi_karti.png")
-        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
-
-class SMSView(discord.ui.View):
-    def __init__(self, gercek_kod, user_name, kart_no, skt, cvv):
-        super().__init__(timeout=60)
-        self.gercek_kod = gercek_kod
-        self.user_name = user_name
-        self.kart_no = kart_no
-        self.skt = skt
-        self.cvv = cvv
-
-    @discord.ui.button(label="Kodu Gir (SMS)", style=discord.ButtonStyle.primary, emoji="📱")
-    async def kodu_gir(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SMSModal(self.gercek_kod, self.user_name, self.kart_no, self.skt, self.cvv))
-
 # --- POP-UP KUTUCUKLAR (MODAL/FORM SİSTEMİ) ---
 
 class OdemeModal(discord.ui.Modal, title="🛍️ Kredi Kartı ile Ödeme Formu"):
     fiyat = discord.ui.TextInput(label="Ürün Fiyatı (TL)", placeholder="Örn: 150", required=True)
     kart_no = discord.ui.TextInput(label="Kart Numarası", placeholder="4444 1234 ...", required=True, max_length=19)
-    skt = discord.ui.TextInput(label="Son Kullanma Tarihi", placeholder="12/28", required=True, max_length=5)
+    skt = discord.ui.TextInput(label="Son Kullanma Tarihi", placeholder="12/28 veya 1228", required=True, max_length=5)
     cvv = discord.ui.TextInput(label="CVV", placeholder="123", required=True, max_length=3)
     aciklama = discord.ui.TextInput(label="Satın Alınan Ürün / Link", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            fiyat_val = float(self.fiyat.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Lütfen geçerli bir sayısal fiyat girin!", ephemeral=True)
+        fiyat_val = validate_positive_amount(self.fiyat.value)
+        if fiyat_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar! Lütfen 0'dan büyük pozitif sayı girin.", ephemeral=True)
 
         db = load_db()
         user_id = str(interaction.user.id)
@@ -239,15 +228,15 @@ class OdemeModal(discord.ui.Modal, title="🛍️ Kredi Kartı ile Ödeme Formu"
         if hesap.get("durum") == "dondurulmus":
             return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir. İşlem yapamazsınız.", ephemeral=True)
 
-        # Kart Bilgileri Doğrulaması (Boşlukları silerek karşılaştırır)
-        girilen_kart = self.kart_no.value.replace(" ", "")
-        gercek_kart = hesap["kart_no"].replace(" ", "")
-        if girilen_kart != gercek_kart or self.skt.value != hesap["skt"] or self.cvv.value != hesap["cvv"]:
+        girilen_kart = clean_card_number(self.kart_no.value)
+        girilen_skt = clean_skt(self.skt.value)
+        
+        if girilen_kart != hesap["kart_no"] or girilen_skt != hesap["skt"] or self.cvv.value.strip() != hesap["cvv"]:
             return await interaction.response.send_message("❌ **İşlem Reddedildi:** Girdiğiniz kart bilgileri hatalı!", ephemeral=True)
 
         komisyon_orani = db["ayarlar"]["komisyon_odeme"]
-        kesilecek_komisyon = fiyat_val * komisyon_orani
-        toplam_tutar = fiyat_val + kesilecek_komisyon
+        kesilecek_komisyon = round(fiyat_val * komisyon_orani, 2)
+        toplam_tutar = round(fiyat_val + kesilecek_komisyon, 2)
 
         if hesap["bakiye"] < toplam_tutar:
             return await interaction.response.send_message(f"❌ Bakiye Yetersiz! Ürün + %{int(komisyon_orani*100)} Vergi için **{toplam_tutar:,.2f} ₺** gerekiyor.", ephemeral=True)
@@ -276,11 +265,15 @@ class TaksitModal(discord.ui.Modal, title="💳 Taksitli Alışveriş"):
     cvv = discord.ui.TextInput(label="CVV Kodu", required=True, max_length=3)
 
     async def on_submit(self, interaction: discord.Interaction):
+        fiyat_val = validate_positive_amount(self.fiyat.value)
         try:
-            fiyat_val = float(self.fiyat.value)
             taksit_val = int(self.taksit.value)
+            if taksit_val <= 0: raise ValueError
         except ValueError:
-            return await interaction.response.send_message("❌ Sayısal değerleri doğru girin!", ephemeral=True)
+            return await interaction.response.send_message("❌ Geçersiz taksit sayısı!", ephemeral=True)
+
+        if fiyat_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar!", ephemeral=True)
 
         db = load_db()
         user_id = str(interaction.user.id)
@@ -288,14 +281,12 @@ class TaksitModal(discord.ui.Modal, title="💳 Taksitli Alışveriş"):
         if hesap.get("durum") == "dondurulmus":
             return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir.", ephemeral=True)
 
-        # Kart Bilgileri Doğrulaması
-        girilen_kart = self.kart_no.value.replace(" ", "")
-        gercek_kart = hesap["kart_no"].replace(" ", "")
-        if girilen_kart != gercek_kart or self.cvv.value != hesap["cvv"]:
+        girilen_kart = clean_card_number(self.kart_no.value)
+        if girilen_kart != hesap["kart_no"] or self.cvv.value.strip() != hesap["cvv"]:
             return await interaction.response.send_message("❌ **İşlem Reddedildi:** Girdiğiniz kart bilgileri hatalı!", ephemeral=True)
 
-        toplam_borc = fiyat_val + (fiyat_val * db["ayarlar"]["komisyon_odeme"])
-        pesinat = toplam_borc / taksit_val
+        toplam_borc = round(fiyat_val + (fiyat_val * db["ayarlar"]["komisyon_odeme"]), 2)
+        pesinat = round(toplam_borc / taksit_val, 2)
 
         if hesap["bakiye"] < pesinat:
             return await interaction.response.send_message(f"❌ Bakiye Yetersiz! İlk taksit olan **{pesinat:,.2f} ₺** ödenemiyor.", ephemeral=True)
@@ -306,7 +297,7 @@ class TaksitModal(discord.ui.Modal, title="💳 Taksitli Alışveriş"):
         db["bekleyen_talepler"][req_id] = {
             "tur": "kredi",
             "user_id": user_id,
-            "tutar": (toplam_borc - pesinat),
+            "tutar": round(toplam_borc - pesinat, 2),
             "aciklama": "Taksitli Alım İşlemi"
         }
         save_db(db)
@@ -320,10 +311,9 @@ class KrediModal(discord.ui.Modal, title="📑 Kredi Başvuru Formu"):
     tutar = discord.ui.TextInput(label="Çekmek İstediğiniz Tutar (TL)", placeholder="Örn: 5000", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tutar_val = float(self.tutar.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Geçerli bir tutar girin!", ephemeral=True)
+        tutar_val = validate_positive_amount(self.tutar.value)
+        if tutar_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar!", ephemeral=True)
 
         db = load_db()
         user_id = str(interaction.user.id)
@@ -346,10 +336,9 @@ class KrediOdeModal(discord.ui.Modal, title="💸 Kredi Borcu Ödeme"):
     tutar = discord.ui.TextInput(label="Ödenecek Tutar (TL)", placeholder="Örn: 1500", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            odeme_val = float(self.tutar.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Geçerli bir tutar girin!", ephemeral=True)
+        odeme_val = validate_positive_amount(self.tutar.value)
+        if odeme_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar! Lütfen 0'dan büyük pozitif sayı girin.", ephemeral=True)
 
         db = load_db()
         user_id = str(interaction.user.id)
@@ -367,9 +356,9 @@ class KrediOdeModal(discord.ui.Modal, title="💸 Kredi Borcu Ödeme"):
         if odeme_val > hesap["kredi_borcu"]:
             odeme_val = hesap["kredi_borcu"]
 
-        hesap["bakiye"] -= odeme_val
-        hesap["kredi_borcu"] -= odeme_val
-        db["kasa"] += odeme_val 
+        hesap["bakiye"] = round(hesap["bakiye"] - odeme_val, 2)
+        hesap["kredi_borcu"] = round(hesap["kredi_borcu"] - odeme_val, 2)
+        db["kasa"] = round(db["kasa"] + odeme_val, 2)
         
         hesap["kredi_notu"] += int(odeme_val * 0.05)
 
@@ -392,10 +381,9 @@ class ParaCekModal(discord.ui.Modal, title="🏧 Para Çekme Formu"):
     tutar = discord.ui.TextInput(label="Çekmek İstediğiniz Tutar (TL)", placeholder="Örn: 500", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tutar_val = float(self.tutar.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Geçerli bir tutar girin!", ephemeral=True)
+        tutar_val = validate_positive_amount(self.tutar.value)
+        if tutar_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar!", ephemeral=True)
 
         db = load_db()
         user_id = str(interaction.user.id)
@@ -404,8 +392,8 @@ class ParaCekModal(discord.ui.Modal, title="🏧 Para Çekme Formu"):
             return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir.", ephemeral=True)
         
         komisyon_orani = db["ayarlar"]["komisyon_cekme"]
-        komisyon = tutar_val * komisyon_orani
-        toplam_dusulecek = tutar_val + komisyon
+        komisyon = round(tutar_val * komisyon_orani, 2)
+        toplam_dusulecek = round(tutar_val + komisyon, 2)
 
         if hesap["bakiye"] < toplam_dusulecek:
             return await interaction.response.send_message(f"❌ Yetersiz Bakiye! Çekim + %{int(komisyon_orani*100)} Komisyon için **{toplam_dusulecek:,.2f} ₺** gerekiyor.", ephemeral=True)
@@ -425,10 +413,9 @@ class ParaYatirModal(discord.ui.Modal, title="💵 Para Yatırma Formu"):
     kanit = discord.ui.TextInput(label="Açıklama / Dekont Linki", style=discord.TextStyle.paragraph, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tutar_val = float(self.tutar.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Geçerli bir tutar girin!", ephemeral=True)
+        tutar_val = validate_positive_amount(self.tutar.value)
+        if tutar_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar!", ephemeral=True)
 
         db = load_db()
         user_id = str(interaction.user.id)
@@ -452,10 +439,9 @@ class HavaleModal(discord.ui.Modal, title="🔄 Para Transferi (Havale/EFT)"):
     aciklama = discord.ui.TextInput(label="Açıklama", required=False)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tutar_val = float(self.tutar.value)
-        except ValueError:
-            return await interaction.response.send_message("❌ Geçerli bir tutar girin!", ephemeral=True)
+        tutar_val = validate_positive_amount(self.tutar.value)
+        if tutar_val is None:
+            return await interaction.response.send_message("❌ Geçersiz tutar!", ephemeral=True)
 
         db = load_db()
         gonderen_id = str(interaction.user.id)
@@ -464,9 +450,10 @@ class HavaleModal(discord.ui.Modal, title="🔄 Para Transferi (Havale/EFT)"):
         if gonderen_hesap.get("durum") == "dondurulmus":
             return await interaction.response.send_message("❌ Hesabınız bloke edilmiştir.", ephemeral=True)
 
+        hedef_iban = clean_iban(self.iban.value)
         alici_id = None
         for uid, data in db["users"].items():
-            if data.get("iban") == self.iban.value:
+            if data.get("iban") == hedef_iban:
                 alici_id = uid
                 break
 
@@ -479,22 +466,22 @@ class HavaleModal(discord.ui.Modal, title="🔄 Para Transferi (Havale/EFT)"):
 
         komisyon = 0.0
         if tutar_val > db["ayarlar"]["havale_sinir"]:
-            komisyon = tutar_val * db["ayarlar"]["komisyon_havale"]
+            komisyon = round(tutar_val * db["ayarlar"]["komisyon_havale"], 2)
         
-        toplam_dusulecek = tutar_val + komisyon
+        toplam_dusulecek = round(tutar_val + komisyon, 2)
 
         if gonderen_hesap["bakiye"] < toplam_dusulecek:
             return await interaction.response.send_message(f"❌ Yetersiz Bakiye! Gönderim + Komisyon için **{toplam_dusulecek:,.2f} ₺** gerekiyor.", ephemeral=True)
 
-        db["users"][gonderen_id]["bakiye"] -= toplam_dusulecek
-        db["users"][alici_id]["bakiye"] += tutar_val
-        db["kasa"] += komisyon
+        db["users"][gonderen_id]["bakiye"] = round(db["users"][gonderen_id]["bakiye"] - toplam_dusulecek, 2)
+        db["users"][alici_id]["bakiye"] = round(db["users"][alici_id]["bakiye"] + tutar_val, 2)
+        db["kasa"] = round(db["kasa"] + komisyon, 2)
         save_db(db)
 
         embed = discord.Embed(title="✅ Transfer Başarılı (Anında Dekont)", color=discord.Color.green())
         embed.add_field(name="Gönderilen", value=f"{tutar_val:,.2f} ₺")
         embed.add_field(name="Kesilen Komisyon", value=f"{komisyon:,.2f} ₺")
-        embed.add_field(name="Alıcı IBAN", value=f"`{self.iban.value}`")
+        embed.add_field(name="Alıcı IBAN", value=f"`{hedef_iban}`")
         if self.aciklama.value:
             embed.add_field(name="Açıklama", value=self.aciklama.value, inline=False)
 
@@ -525,7 +512,7 @@ async def faiz_isle():
             
             ekstra_oran = (gun // 10) * 0.02
             toplam_faiz_orani = 0.02 + ekstra_oran
-            user_data["kredi_borcu"] *= (1 + toplam_faiz_orani)
+            user_data["kredi_borcu"] = round(user_data["kredi_borcu"] * (1 + toplam_faiz_orani), 2)
 
             if gun % 10 == 0: 
                 user_data["kredi_notu"] -= 15
@@ -533,13 +520,11 @@ async def faiz_isle():
                 
     save_db(db)
 
-# --- BOT AKTİF OLDUĞUNDA KOMUTLARI ANINDA SUNUCUYA YÜKLE ---
 @bot.event
 async def on_ready():
     print(f"{bot.user} aktif! Sistem 7/24 çalışmaya hazır.")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Borsa ve Kurları"))
     
-    # Global senkronizasyonun gecikmesini engellemek için direkt sunuculara zorla yükler
     for guild in bot.guilds:
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
@@ -547,7 +532,6 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild):
-    # Yeni bir sunucuya eklenirse komutları oraya da anında yükler
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
 
@@ -575,7 +559,7 @@ async def help_cmd(interaction: discord.Interaction):
     user_cmds = """
     `/hesap-bilgi` - Hesap detaylarını gösterir.
     `/kredi-notum` - Banka puanını ve durumunu gösterir.
-    `/kartim` - Görsel banka kartını üretir (SMS Doğrulamalı).
+    `/kartim` - Görsel banka kartını üretir ve kopyalanabilir bilgileri atar.
     `/odeme-yap` - Form açarak kredi kartı ile ürün satın alır.
     `/taksitlendir` - Ürünü kart ile taksitle alıp kalanı borca ekler.
     `/havale` - Başka bir IBAN'a anında para yollar.
@@ -634,7 +618,7 @@ async def kredi_notum(interaction: discord.Interaction):
     embed.set_footer(text="Borcunuzu düzenli ödedikçe notunuz artar, geciktirdikçe düşer.")
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="kartim", description="Banka kartını güvenlik doğrulamasıyla gösterir.")
+@bot.tree.command(name="kartim", description="Banka kartını ve kopyalanabilir bilgilerini atar.")
 async def kartim(interaction: discord.Interaction):
     db = load_db()
     hesap = get_or_create_user(db, str(interaction.user.id))
@@ -642,11 +626,18 @@ async def kartim(interaction: discord.Interaction):
     if hesap.get("durum") == "dondurulmus":
         return await interaction.response.send_message("❌ Hesabınız bloke edildiği için kartınıza erişemezsiniz.", ephemeral=True)
     
-    gercek_kod = str(random.randint(1000, 9999))
-    embed = discord.Embed(title="🔒 SMS Güvenlik Doğrulaması", description=f"Güvenlik Kodunuz: **{gercek_kod}**\n\nKart bilgilerinizi görüntülemek için butona tıklayıp kodu girin.", color=discord.Color.blue())
-    view = SMSView(gercek_kod, interaction.user.display_name, hesap["kart_no"], hesap["skt"], hesap["cvv"])
+    card_img = generate_credit_card(interaction.user.display_name, hesap["kart_no"], hesap["skt"], hesap["cvv"])
+    file = discord.File(card_img, filename="kredi_karti.png")
     
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    embed = discord.Embed(title="💳 Dijital Kredi Kartınız", color=discord.Color.dark_purple())
+    embed.description = "Aşağıdaki bilgilerin üzerine tıklayarak kopyalayabilirsiniz:"
+    embed.add_field(name="Kart Numarası", value=f"```{hesap['kart_no']}```", inline=False)
+    embed.add_field(name="Son Kullanma Tarihi", value=f"```{hesap['skt']}```", inline=True)
+    embed.add_field(name="CVV", value=f"```{hesap['cvv']}```", inline=True)
+    embed.add_field(name="IBAN", value=f"```{hesap['iban']}```", inline=False)
+    embed.set_image(url="attachment://kredi_karti.png")
+    
+    await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
 
 @bot.tree.command(name="kredi-ode", description="Birikmiş kredi borcunu bakiyenden ödersin.")
 async def kredi_ode(interaction: discord.Interaction):
@@ -682,7 +673,7 @@ async def havale(interaction: discord.Interaction):
 async def bakiye_ver(interaction: discord.Interaction, kullanici: discord.Member, miktar: float):
     db = load_db()
     hesap = get_or_create_user(db, str(kullanici.id))
-    hesap["bakiye"] += miktar
+    hesap["bakiye"] = round(hesap["bakiye"] + miktar, 2)
     save_db(db)
     
     embed = discord.Embed(title="💰 Bakiye Tanımlandı", color=discord.Color.green())
@@ -696,7 +687,7 @@ async def toplu_bakiye_ver(interaction: discord.Interaction, rol: discord.Role, 
     kisi_sayisi = 0
     for member in rol.members:
         hesap = get_or_create_user(db, str(member.id))
-        hesap["bakiye"] += miktar
+        hesap["bakiye"] = round(hesap["bakiye"] + miktar, 2)
         kisi_sayisi += 1
     
     save_db(db)
@@ -706,25 +697,26 @@ async def toplu_bakiye_ver(interaction: discord.Interaction, rol: discord.Role, 
 @app_commands.default_permissions(administrator=True)
 async def hesap_mudahale(interaction: discord.Interaction, iban: str, eklenecek_tutar: float):
     db = load_db()
+    hedef_iban = clean_iban(iban)
     hedef_id = None
     for uid, data in db["users"].items():
-        if data.get("iban") == iban:
+        if data.get("iban") == hedef_iban:
             hedef_id = uid
             break
             
     if not hedef_id:
         return await interaction.response.send_message("❌ Bu IBAN'a ait hesap bulunamadı.", ephemeral=True)
         
-    db["users"][hedef_id]["bakiye"] += eklenecek_tutar
+    db["users"][hedef_id]["bakiye"] = round(db["users"][hedef_id]["bakiye"] + eklenecek_tutar, 2)
     save_db(db)
-    await interaction.response.send_message(f"✅ **{iban}** nolu hesaba müdahale edildi. Yeni Bakiye: **{db['users'][hedef_id]['bakiye']:,.2f} ₺**")
+    await interaction.response.send_message(f"✅ **{hedef_iban}** nolu hesaba müdahale edildi. Yeni Bakiye: **{db['users'][hedef_id]['bakiye']:,.2f} ₺**")
 
 @bot.tree.command(name="kredi-yapilandir", description="[YÖNETİCİ] Borcu şişen kullanıcının faiz döngüsünü sıfırlar.")
 @app_commands.default_permissions(administrator=True)
 async def kredi_yapilandir(interaction: discord.Interaction, kullanici: discord.Member, yeni_borc_tutari: float):
     db = load_db()
     hesap = get_or_create_user(db, str(kullanici.id))
-    hesap["kredi_borcu"] = yeni_borc_tutari
+    hesap["kredi_borcu"] = round(yeni_borc_tutari, 2)
     hesap["kredi_gun_sayisi"] = 0
     save_db(db)
     await interaction.response.send_message(f"✅ {kullanici.mention} kullanıcısının borcu **{yeni_borc_tutari:,.2f} ₺** olarak sabitlendi ve faiz gün sayacı sıfırlandı.")
